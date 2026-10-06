@@ -39,7 +39,7 @@ src/s3bloom/
 │   └── pipeline.py         #   load → mask → resample → export
 │
 ├── compositing/            # Cross-pass aggregation
-│   └── temporal.py         #   N-day rolling nanmean
+│   └── temporal.py         #   N-day rolling geometric mean
 │
 ├── export/                 # Format-specific writers
 │   ├── __init__.py         #   Dispatcher (export_dataset)
@@ -110,7 +110,7 @@ the rest of the code reads itself.
 | `ProductInfo` | `discovery/search.py` | Frozen dataclass: catalogue metadata for one CDSE product. |
 | `satpy.Scene` | (satpy) | Container for a loaded `.SEN3` product. Used internally in `processing/`; never returned to the CLI. |
 | `xarray.DataArray` | (xarray) | The currency of the processing/export layer. Carries the raster + CRS attributes. |
-| `PassResult` | `processing/pipeline.py` | Frozen dataclass: in-memory outputs of one fully-processed pass. Hand-off from processing → compositing. |
+| `PassResult` | `processing/pipeline.py` | Frozen dataclass: the outputs of one pass, processed now or found on disk from an earlier run. Its arrays are read lazily from the per-pass NetCDF, never from the raw product. Hand-off from processing → compositing. |
 | `Provenance` | `metadata/provenance.py` | Frozen dataclass embedded in every output file. Lineage record. |
 
 Everything is **immutable** where possible (`frozen=True` dataclasses,
@@ -144,8 +144,11 @@ needed.
    the Open-Water atmospheric correction chain).
 2. Add a `COLORMAP_SETTINGS` entry — pick a `cmocean` colormap that
    matches the variable's nature, set `vmin`/`vmax` from typical
-   coastal values, and set `log10_encoded` to match the storage
-   convention of the OLCI product.
+   coastal values (display only), and add the product's physical range
+   in linear units to `VALID_RANGE`. Variables that the OLCI product
+   stores as log10 are converted to linear on load by
+   `processing/reader.py`, driven by their `units`; nothing needs to be
+   declared for that.
 3. Add the CF `long_name` and `standard_name` to the helpers in
    `export/netcdf.py`.
 
@@ -196,25 +199,27 @@ and `defaults.py` would each consume one field of that record.
   exporter cheap.
 * **Outputs are idempotent**: re-running the pipeline with the same
   parameters skips already-downloaded `.SEN3` products and, by default,
-  also skips per-pass and composite exports whose output files already
-  exist on disk. Pass `--overwrite` to force a full reprocess. There is
-  no caching layer beyond on-disk file presence.
+  also skips per-pass and composite exports that exist on disk and are
+  current. A per-pass output is current when its provenance says
+  `value_scale = linear` and names the same source product; a composite
+  is current when its recorded source products match the window. Skipped
+  passes still feed compositing through their NetCDF files, so a resumed
+  run and a fresh run give the same composites. Pass `--overwrite` to
+  force a full reprocess.
+* **Every output is linear and says so.** The `s3bloom_value_scale`
+  attribute / TIFF tag is the contract with downstream scripts; files
+  without it predate 0.2 and hold log10 values.
 
 ## Tests
 
-Tests live under `tests/` and cover the pure / deterministic modules:
+Tests live under `tests/`, one file per module (`test_<module>.py`),
+and run offline on synthetic data. Network access is mocked in
+`test_search.py` and `test_download.py`; `test_resampling.py` resamples
+a small synthetic swath through the real satpy/pyresample code path.
 
-| Test file | Covers |
-|-----------|--------|
-| `test_config.py` | Pydantic model validation and `BoundingBox.from_string` |
-| `test_masking.py` | Flag → bitmask resolution and the EUMETSAT preset combinations |
-| `test_naming.py` | Filename and path generation |
-| `test_provenance.py` | `Provenance` serialisation to dict / NetCDF attrs |
-
-The discovery / processing / compositing / export layers are *not*
-unit-tested because they require either CDSE credentials or large
-input files. They are exercised by running the pipeline end-to-end on
-a small AOI; consider this the integration test.
+One test in `test_reader.py` is marked `integration`: it loads a real
+`.SEN3` product from `data/raw/` and is skipped when that product is
+absent. Deselect it with `pytest -m "not integration"`.
 
 ## Things to watch out for
 
@@ -230,8 +235,15 @@ a small AOI; consider this the integration test.
   prefix. Don't tighten that to a hard error without first verifying
   current CDSE products are clean.
 * **CRS coordinates from rioxarray are not NetCDF-serializable.**
-  `export/netcdf.py` strips them; if you start using new accessors
-  that attach extra coords, extend the strip list.
+  `export/netcdf.py` strips them and writes the CRS as a CF
+  grid-mapping variable (`crs`) instead; if you start using new
+  accessors that attach extra coords, extend the strip list.
+* **Do not pass `reader_kwargs={"unlog": True}` to satpy.** In satpy
+  0.60 it makes the `wqsf` flag layer fail to load. The log10 → linear
+  conversion lives in `processing/reader.py` for that reason.
+* **Keep `mask_area=False` in `resample_scene`.** pyresample's default
+  for swath data drops masked source pixels from the nearest-neighbour
+  search, which fills masked gaps from valid neighbours.
 * **`cartopy.crs.epsg(code)` doesn't cover every projection.** EPSG:3035
   has an explicit handler in `export/png.py`; add explicit handlers
   for any projection you start using regularly.

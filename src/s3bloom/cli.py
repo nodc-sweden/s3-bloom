@@ -156,7 +156,7 @@ def run(
     overwrite: bool = typer.Option(
         False,
         "--overwrite",
-        help="Re-process and overwrite outputs even if they already exist.",
+        help="Re-process and overwrite outputs even if they exist and are up to date.",
     ),
     verbose: bool = typer.Option(
         False,
@@ -171,7 +171,15 @@ def run(
     stage prints a numbered banner so a long run can be followed in the
     terminal. Failures in one pass are logged and the next pass is
     attempted; a run completes successfully as long as at least one
-    pass produced outputs.
+    pass was processed or was skipped because its outputs were already
+    current.
+
+    Compositing always runs over every pass of the period, including
+    the skipped ones, which are read back from their per-pass NetCDFs.
+    A resumed run therefore builds the same composites as a single
+    fresh run, and composites that are already up to date are left
+    alone. This needs ``netcdf`` among the output formats; without it
+    skipped passes cannot be read back and a warning is printed.
     """
     _setup_logging(verbose)
 
@@ -223,24 +231,24 @@ def run(
     console.print(
         f"\n[bold blue]Step 3/4: Processing {len(product_paths)} passes...[/bold blue]"
     )
+    # Processed and skipped passes alike: both take part in compositing.
     pass_results = []
-    skipped_count = 0
     for i, product_path in enumerate(product_paths, 1):
         console.print(
             f"  [{i}/{len(product_paths)}] {product_path.name}"
         )
         try:
             result = process_single_pass(product_path, config)
-            if result is None:
-                skipped_count += 1
+            pass_results.append(result)
+            if result.skipped:
                 console.print("  [dim]Skipped (outputs exist)[/dim]")
-            else:
-                pass_results.append(result)
-                if config.output.delete_raw:
-                    shutil.rmtree(product_path)
-                    logging.getLogger(__name__).debug(
-                        "Deleted raw product: %s", product_path.name
-                    )
+            elif config.output.delete_raw:
+                # Safe right away: the result reads from the per-pass
+                # outputs (or holds the array), never from the product.
+                shutil.rmtree(product_path)
+                logging.getLogger(__name__).debug(
+                    "Deleted raw product: %s", product_path.name
+                )
         except Exception as exc:
             # One bad product must not abort the run — log and continue
             # so the user gets results from every product that worked.
@@ -249,19 +257,15 @@ def run(
                 "Failed to process %s", product_path.name
             )
         finally:
-            # satpy / xarray hold large lazy graphs; force collection
-            # between products to keep peak RSS low on long runs.
+            # The satpy scene of a pass (file handles, resampling
+            # caches) is no longer referenced once the pass returns;
+            # collect it between products to keep peak RSS low on long
+            # runs.
             gc.collect()
 
-    if not pass_results and not skipped_count:
+    if not pass_results:
         console.print("[red]No passes were processed successfully.[/red]")
         raise typer.Exit(code=1)
-    if not pass_results and skipped_count:
-        console.print(
-            f"[dim]All {skipped_count} pass(es) already processed. "
-            "Use --overwrite to reprocess.[/dim]"
-        )
-        raise typer.Exit(code=0)
 
     composite_files: list[Path] = []
     if no_composites:
@@ -271,9 +275,10 @@ def run(
             f"\n[bold blue]Step 4/4: Creating {config.output.composite_window_days}-day "
             f"composites...[/bold blue]"
         )
+        _warn_if_skipped_passes_lack_data(pass_results)
         composite_files = create_composites(pass_results, config)
 
-    _print_summary(pass_results, composite_files, config, skipped_count)
+    _print_summary(pass_results, composite_files, config)
 
 
 @app.command()
@@ -369,20 +374,45 @@ def _print_config_summary(config: PipelineConfig) -> None:
     console.print(f"  Output: {config.output.base_dir}")
 
 
+def _warn_if_skipped_passes_lack_data(pass_results: list) -> None:
+    """Warn when skipped passes cannot take part in compositing.
+
+    A skipped pass is read back from its per-pass NetCDF. Without
+    ``netcdf`` among the output formats there is nothing to read:
+    existing composites for those dates are kept and new ones are built
+    from the passes processed in this run only.
+    """
+    without_data = sum(1 for pr in pass_results if pr.skipped and not pr.datasets)
+    if not without_data:
+        return
+    console.print(
+        f"[yellow]Warning: {without_data} skipped pass(es) have no per-pass "
+        "NetCDF to read back. Existing composites for their dates are kept; "
+        "new ones cover only the passes processed in this run. Add netcdf to "
+        "--formats for resumable compositing.[/yellow]"
+    )
+
+
 def _print_summary(
     pass_results: list,
     composite_files: list[Path],
     config: PipelineConfig,
-    skipped_count: int = 0,
 ) -> None:
-    """Print the final tally of passes and outputs at the end of a run."""
+    """Print the final tally of passes and outputs at the end of a run.
+
+    *pass_results* holds processed and skipped passes; they are counted
+    separately. The file counts are the files written by this run, so
+    skipped passes and composites that were already up to date do not
+    add to them.
+    """
+    skipped_count = sum(1 for pr in pass_results if pr.skipped)
     total_pass_files = sum(len(pr.output_files) for pr in pass_results)
     console.print("\n[bold green]Pipeline complete![/bold green]")
-    console.print(f"  Passes processed: {len(pass_results)}")
+    console.print(f"  Passes processed: {len(pass_results) - skipped_count}")
     if skipped_count:
         console.print(f"  Passes skipped (already existed): {skipped_count}")
-    console.print(f"  Pass output files: {total_pass_files}")
-    console.print(f"  Composite files: {len(composite_files)}")
+    console.print(f"  Pass output files written: {total_pass_files}")
+    console.print(f"  Composite files written: {len(composite_files)}")
     console.print(f"  Output directory: {config.output.base_dir}")
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "s3bloom"
-version = "0.1.1.dev1"
+version = "0.2.0"
 description = "Sentinel-3 OLCI L2 phytoplankton bloom pipeline"
 readme = "README.md"
 authors = [
@@ -39,4 +39,9 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.0.2",
     "pytest-cov>=7.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: needs real Sentinel-3 products under data/raw and is slow (deselect with -m 'not integration')",
 ]

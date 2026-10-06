@@ -100,7 +100,7 @@ data/
 │   ├── geotiff/        #   CRS-tagged rasters
 │   ├── netcdf/         #   CF-compliant with full metadata
 │   └── png/            #   Maps with colorbar (cmocean algae cmap)
-└── composites/         # 3-day rolling nanmean composites
+└── composites/         # 3-day rolling geometric-mean composites
     ├── geotiff/
     ├── netcdf/
     └── png/
@@ -109,7 +109,7 @@ data/
 File naming:
 ```
 s3bloom_chl_nn_pass_20240315T091500_S3A.tif          # single pass
-s3bloom_chl_nn_composite3d_20240315_S3A-S3B.tif      # 3-day composite
+s3bloom_chl_nn_composite3d_20240315.tif              # 3-day composite
 ```
 
 ## Masking
@@ -146,11 +146,16 @@ Run `s3bloom list-presets` to see the exact flags per product and preset.
 
 ## Datasets
 
-| Name | Description | Atm. correction | Units (stored) | Units (real) |
-|------|-------------|:---:|----------------|--------------|
-| `chl_nn` | Chlorophyll-a, neural network | AAC (Complex Water) | log10(mg m⁻³) | mg m⁻³ |
-| `chl_oc4me` | Chlorophyll-a, OC4Me band-ratio | BAC (Open Water) | log10(mg m⁻³) | mg m⁻³ |
-| `tsm_nn` | Total suspended matter, neural network | AAC (Complex Water) | log10(g m⁻³) | g m⁻³ |
+| Name | Description | Atm. correction | Units in output files |
+|------|-------------|:---:|-----------------------|
+| `chl_nn` | Chlorophyll-a, neural network | AAC (Complex Water) | mg m⁻³ |
+| `chl_oc4me` | Chlorophyll-a, OC4Me band-ratio | BAC (Open Water) | mg m⁻³ |
+| `tsm_nn` | Total suspended matter, neural network | AAC (Complex Water) | g m⁻³ |
+
+All outputs hold **linear** concentrations and carry the attribute
+`s3bloom_value_scale = linear`. Files written by s3bloom before 0.2 have no
+such attribute and hold log10 of the concentration; see
+[docs/workflow.md](docs/workflow.md#data-units).
 
 `chl_nn` is the default. It uses a neural network with the Alternative
 Atmospheric Correction (AAC), trained for Case-2 (coastal/complex) waters,

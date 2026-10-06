@@ -13,8 +13,13 @@ CRS handling
 ------------
 rioxarray attaches non-serializable CRS objects as coordinates which
 NetCDF4 cannot write. We strip those coordinates and instead store the
-CRS as the WKT string ``crs_wkt`` global attribute, which CF readers
-(xarray + ``decode_cf``, MetPy, etc.) understand.
+CRS as a CF grid mapping: a scalar integer data variable named ``crs``
+whose attributes are the CF projection parameters (from
+:meth:`pyproj.CRS.to_cf`, which includes the full WKT as ``crs_wkt``)
+plus the same WKT under ``spatial_ref`` for GDAL-based readers. The data
+variable points at it through its ``grid_mapping`` attribute, so CF
+readers (xarray with ``decode_coords="all"``, rioxarray, GDAL, terra)
+recover the CRS without out-of-band metadata.
 """
 
 from __future__ import annotations
@@ -25,11 +30,15 @@ from pathlib import Path
 
 import numpy as np
 import xarray as xr
+from pyproj import CRS
 
-from s3bloom.defaults import COLORMAP_SETTINGS
+from s3bloom.defaults import COLORMAP_SETTINGS, VALID_RANGE
 from s3bloom.metadata.provenance import Provenance
 
 logger = logging.getLogger(__name__)
+
+# Name of the CF grid-mapping variable holding the CRS.
+_GRID_MAPPING_NAME = "crs"
 
 
 def export_netcdf(
@@ -43,14 +52,17 @@ def export_netcdf(
     Parameters
     ----------
     data : xarray.DataArray
-        Resampled array on the target grid.
+        Resampled array on the target grid, in linear units. Values
+        are written as given.
     path : pathlib.Path
         Output path.
     provenance : Provenance
-        Lineage record stored as ``s3bloom_*`` global attributes.
+        Lineage record stored as ``s3bloom_*`` global attributes,
+        among them ``s3bloom_value_scale``.
     dataset_name : str
-        Logical dataset name; used to look up CF ``standard_name`` and
-        ``long_name`` and to set the variable name inside the file.
+        Logical dataset name; used to look up CF ``standard_name``,
+        ``long_name``, ``units`` and the valid range, and to set the
+        variable name inside the file.
 
     Returns
     -------
@@ -85,11 +97,24 @@ def _build_dataset(
 ) -> xr.Dataset:
     """Wrap *data* in a CF-1.8 :class:`xarray.Dataset` with metadata.
 
-    Adds ``long_name``, ``standard_name``, ``units``, ``valid_min``/
-    ``valid_max``, axis attributes for the projected coordinates, and
-    every provenance field as a global attribute.
+    Adds ``long_name``, ``standard_name``, ``units``, axis attributes
+    for the projected coordinates, a ``crs`` grid-mapping variable built
+    from ``provenance.projection``, and every provenance field as a
+    global attribute.
+
+    ``units`` comes from :data:`s3bloom.defaults.COLORMAP_SETTINGS` and
+    ``valid_min``/``valid_max`` from :data:`s3bloom.defaults.VALID_RANGE`
+    (the physical range in linear units, not the colour-bar limits).
+    Datasets without a ``VALID_RANGE`` entry get no valid-range
+    attributes rather than an invented one.
     """
     color_cfg = COLORMAP_SETTINGS.get(dataset_name, {})
+    valid_range = VALID_RANGE.get(dataset_name)
+    valid_range_attrs = (
+        {"valid_min": float(valid_range[0]), "valid_max": float(valid_range[1])}
+        if valid_range is not None
+        else {}
+    )
 
     da = data.copy()
 
@@ -105,8 +130,8 @@ def _build_dataset(
         "long_name": _long_name(dataset_name),
         "units": color_cfg.get("units", ""),
         "standard_name": _standard_name(dataset_name),
-        "valid_min": float(color_cfg.get("vmin", 0)),
-        "valid_max": float(color_cfg.get("vmax", 1000)),
+        **valid_range_attrs,
+        "grid_mapping": _GRID_MAPPING_NAME,
     }
 
     ds = da.to_dataset()
@@ -137,8 +162,18 @@ def _build_dataset(
             "axis": "Y",
         }
 
-    # Store CRS as CF grid_mapping
-    ds.attrs["crs_wkt"] = provenance.projection
+    # Store the CRS as a CF grid-mapping variable: a scalar integer data
+    # variable (not a coordinate) that the data variable references via
+    # its ``grid_mapping`` attribute.
+    crs = CRS.from_user_input(provenance.projection)
+    ds = ds.assign(
+        {
+            _GRID_MAPPING_NAME: xr.DataArray(
+                np.int32(0),
+                attrs={**crs.to_cf(), "spatial_ref": crs.to_wkt()},
+            )
+        }
+    )
 
     return ds
 
