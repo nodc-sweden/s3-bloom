@@ -5,13 +5,8 @@ Each PNG is a publication-quality map: data layer on top, Natural Earth
 and a colorbar matching the dataset's recommended palette
 (``cmocean.algae`` for chlorophyll, ``cmocean.turbid`` for TSM).
 
-Stored vs displayed values
---------------------------
-The OLCI L2 chlorophyll/TSM products store ``log10`` of the
-concentration. The GeoTIFF and NetCDF outputs preserve those raw
-log-space values, but PNG maps display the **linear** concentration
-because that is what humans expect to see; this is controlled by the
-``log10_encoded`` flag in :data:`s3bloom.defaults.COLORMAP_SETTINGS`.
+The values are plotted exactly as they are passed in: linear
+concentrations, the same numbers the GeoTIFF and NetCDF outputs hold.
 
 The ``Agg`` matplotlib backend is forced at import time to keep this
 module headless / display-free (CI, server, etc.).
@@ -84,14 +79,14 @@ def export_png(
     Parameters
     ----------
     data : xarray.DataArray
-        Resampled array on the target grid; must have ``x``/``y``
-        projected coordinates.
+        Resampled array on the target grid, in linear units; must
+        have ``x``/``y`` projected coordinates. Plotted as is.
     path : pathlib.Path
         Output path.
     provenance : Provenance
         Used for the title and to derive the cartopy CRS.
     dataset_name : str
-        Used to look up the colormap, value range and units in
+        Used to look up the colormap, colour-bar limits and label in
         :data:`s3bloom.defaults.COLORMAP_SETTINGS`.
 
     Returns
@@ -110,12 +105,6 @@ def export_png(
     if hasattr(values, "compute"):
         values = values.compute()
     values = np.asarray(values, dtype=np.float64)
-
-    # OLCI L2 chl/tsm products store log10(concentration); convert to
-    # linear units for display only. The on-disk GeoTIFF/NetCDF outputs
-    # preserve the raw log10 values for quantitative analysis.
-    if color_cfg.get("log10_encoded"):
-        values = np.power(10.0, values)
 
     data_crs = _projection_from_epsg(provenance.projection)
 

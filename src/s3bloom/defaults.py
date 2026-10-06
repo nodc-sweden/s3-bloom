@@ -1,5 +1,5 @@
 """Pipeline-wide defaults: bounding-box presets, WQSF masking flag tables,
-default projection/resolution, and colormap settings.
+default projection/resolution, colormap settings and valid data ranges.
 
 This module is the single source of truth for tunable constants. Anything
 that a user might reasonably want to change without editing application
@@ -183,42 +183,56 @@ DEFAULT_RESOLUTION = 300  # metres
 
 COMPOSITE_WINDOW_DAYS = 3
 
-# Per-dataset visualisation defaults used by the PNG exporter.
-#   cmap          : matplotlib/cmocean colormap name
-#   vmin / vmax   : colorbar range, in real-units (mg m⁻³, g m⁻³)
-#   log_scale     : apply LogNorm to the colorbar (keeps low values visible)
-#   log10_encoded : the stored values are log10 of the real concentration;
-#                   the exporter inverts this for display only — GeoTIFF /
-#                   NetCDF outputs preserve the raw log10 values.
-#   label / units : colorbar label and axis units
+# Per-dataset display and unit defaults.
+#
+# Every array the pipeline handles after loading holds LINEAR values
+# (mg m-3, g m-3): the reader undoes the log10 encoding of the OLCI L2
+# products, and the GeoTIFF, NetCDF and PNG outputs all carry the same
+# linear values. Nothing in this table changes the data.
+#   cmap        : matplotlib/cmocean colormap name
+#   vmin / vmax : colour-bar limits of the PNG maps, in linear units.
+#                 Display only — values outside are clipped on the map
+#                 but are still valid data; see VALID_RANGE for the
+#                 physical range.
+#   log_scale   : apply LogNorm to the colour bar (keeps low values visible)
+#   label       : colour-bar label (display text)
+#   units       : CF ``units`` attribute written to NetCDF, plain ASCII
 COLORMAP_SETTINGS: dict[str, dict] = {
     "chl_nn": {
         "cmap": "cmo.algae",
         "vmin": 0.0,
         "vmax": 30.0,
         "log_scale": False,
-        "log10_encoded": True,
         "label": "Chl-a (mg m⁻³)",
-        "units": "mg m⁻³",
+        "units": "mg m-3",
     },
     "chl_oc4me": {
         "cmap": "cmo.algae",
         "vmin": 0.0,
         "vmax": 30.0,
         "log_scale": False,
-        "log10_encoded": True,
         "label": "Chl-a OC4Me (mg m⁻³)",
-        "units": "mg m⁻³",
+        "units": "mg m-3",
     },
     "tsm_nn": {
         "cmap": "cmo.turbid",
         "vmin": 0.5,
         "vmax": 50.0,
         "log_scale": False,
-        "log10_encoded": True,
         "label": "TSM (g m⁻³)",
-        "units": "g m⁻³",
+        "units": "g m-3",
     },
+}
+
+# Physically valid ``(min, max)`` per dataset, in the linear units above.
+# Written as CF ``valid_min`` / ``valid_max`` by the NetCDF exporter and
+# deliberately separate from the colour-bar limits. 100 mg m-3 is the
+# upper bound of the OLCI L2 chlorophyll encoding. Datasets without an
+# entry get no valid-range attributes.
+VALID_RANGE: dict[str, tuple[float, float]] = {
+    "chl_nn": (0.0, 100.0),
+    "chl_oc4me": (0.0, 100.0),
+    "tsm_nn": (0.0, 1000.0),
 }
 
 # CDSE rate-limits aggressive downloaders. Two parallel streams is the

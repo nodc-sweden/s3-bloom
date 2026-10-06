@@ -14,7 +14,7 @@ algorithm failure, ...). The masking step:
 
 The mask is applied with :func:`apply_mask`, which sets bad pixels to
 NaN. NaN propagates correctly through resampling and is naturally
-ignored by ``nanmean`` compositing.
+ignored by the NaN-skipping geometric-mean compositing.
 
 Why use product metadata instead of a static table
 --------------------------------------------------
@@ -148,7 +148,8 @@ def apply_mask(
 
     Returns a new DataArray; the input is not mutated. NaN is preferred
     over a sentinel value because xarray and dask propagate it through
-    arithmetic, and ``nanmean`` ignores it during compositing.
+    arithmetic, and the NaN-skipping geometric mean ignores it during
+    compositing.
     """
     return data.where(~mask, other=np.nan)
 

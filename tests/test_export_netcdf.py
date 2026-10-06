@@ -1,7 +1,11 @@
 """Tests for export.netcdf."""
+from dataclasses import replace
+
 import numpy as np
 import pytest
+import rioxarray  # noqa: F401  (registers the ``.rio`` accessor)
 import xarray as xr
+from pyproj import CRS
 
 from s3bloom.export.netcdf import (
     _build_dataset,
@@ -57,15 +61,70 @@ class TestBuildDataset:
         assert "s3bloom_source_product" in ds.attrs
         assert "s3bloom_satellite" in ds.attrs
 
-    def test_crs_wkt_stored(self, simple_dataarray, provenance):
+    def test_crs_stored_as_cf_grid_mapping_variable(self, simple_dataarray, provenance):
         ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
-        assert "crs_wkt" in ds.attrs
-        assert ds.attrs["crs_wkt"] == "EPSG:3035"
+        assert "crs" in ds.data_vars
+        assert ds["crs"].ndim == 0
+        assert np.issubdtype(ds["crs"].dtype, np.integer)
+        assert CRS.from_cf(ds["crs"].attrs).to_epsg() == 3035
+
+    def test_crs_variable_carries_wkt_for_gdal(self, simple_dataarray, provenance):
+        ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
+        attrs = ds["crs"].attrs
+        assert CRS.from_wkt(attrs["spatial_ref"]).to_epsg() == 3035
+        assert CRS.from_wkt(attrs["crs_wkt"]).to_epsg() == 3035
+
+    def test_data_variable_references_grid_mapping(self, simple_dataarray, provenance):
+        ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
+        assert ds["chl_nn"].attrs["grid_mapping"] == "crs"
+
+    def test_no_bare_authority_code_global_attribute(self, simple_dataarray, provenance):
+        ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
+        assert "crs_wkt" not in ds.attrs
+
+    def test_crs_follows_provenance_projection(self, simple_dataarray, provenance):
+        utm = replace(provenance, projection="EPSG:32633")
+        ds = _build_dataset(simple_dataarray, "chl_nn", utm)
+        assert CRS.from_cf(ds["crs"].attrs).to_epsg() == 32633
+        assert CRS.from_wkt(ds["crs"].attrs["spatial_ref"]).to_epsg() == 32633
 
     def test_variable_has_long_name(self, simple_dataarray, provenance):
         ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
         assert "long_name" in ds["chl_nn"].attrs
         assert "units" in ds["chl_nn"].attrs
+
+    @pytest.mark.parametrize(
+        ("dataset_name", "units"),
+        [("chl_nn", "mg m-3"), ("chl_oc4me", "mg m-3"), ("tsm_nn", "g m-3")],
+    )
+    def test_units_are_linear_ascii_cf(
+        self, simple_dataarray, provenance, dataset_name, units
+    ):
+        ds = _build_dataset(simple_dataarray, dataset_name, provenance)
+        assert ds[dataset_name].attrs["units"] == units
+
+    def test_chl_valid_range_is_linear_physical_range(self, simple_dataarray, provenance):
+        ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
+        assert ds["chl_nn"].attrs["valid_min"] == 0.0
+        assert ds["chl_nn"].attrs["valid_max"] == 100.0
+
+    def test_valid_range_is_not_the_colour_bar_range(self, simple_dataarray, provenance):
+        ds = _build_dataset(simple_dataarray, "tsm_nn", provenance)
+        assert ds["tsm_nn"].attrs["valid_min"] == 0.0
+        assert ds["tsm_nn"].attrs["valid_max"] == 1000.0
+
+    def test_unknown_dataset_has_no_valid_range(self, simple_dataarray, provenance):
+        ds = _build_dataset(simple_dataarray, "unknown_var", provenance)
+        assert "valid_min" not in ds["unknown_var"].attrs
+        assert "valid_max" not in ds["unknown_var"].attrs
+
+    def test_value_scale_global_attribute(self, simple_dataarray, provenance):
+        ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
+        assert ds.attrs["s3bloom_value_scale"] == "linear"
+
+    def test_values_are_stored_as_given(self, simple_dataarray, provenance):
+        ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
+        np.testing.assert_array_equal(ds["chl_nn"].values, simple_dataarray.values)
 
     def test_x_y_coord_attrs(self, simple_dataarray, provenance):
         ds = _build_dataset(simple_dataarray, "chl_nn", provenance)
@@ -114,3 +173,49 @@ class TestExportNetcdf:
         ds = xr.open_dataset(out)
         assert ds.attrs.get("Conventions") == "CF-1.8"
         ds.close()
+
+    def test_written_file_declares_linear_scale(self, tmp_path, simple_dataarray, provenance):
+        out = tmp_path / "out.nc"
+        export_netcdf(simple_dataarray, out, provenance, "chl_nn")
+        with xr.open_dataset(out) as ds:
+            assert ds.attrs["s3bloom_value_scale"] == "linear"
+            assert ds["chl_nn"].attrs["units"] == "mg m-3"
+            assert ds["chl_nn"].attrs["valid_min"] == 0.0
+            assert ds["chl_nn"].attrs["valid_max"] == 100.0
+
+    def test_written_values_round_trip_unchanged(self, tmp_path, simple_dataarray, provenance):
+        out = tmp_path / "out.nc"
+        export_netcdf(simple_dataarray, out, provenance, "chl_nn")
+        with xr.open_dataset(out) as ds:
+            np.testing.assert_array_equal(ds["chl_nn"].values, simple_dataarray.values)
+
+    def test_written_unknown_dataset_has_no_valid_range(
+        self, tmp_path, simple_dataarray, provenance
+    ):
+        out = tmp_path / "out.nc"
+        export_netcdf(simple_dataarray, out, provenance, "unknown_var")
+        with xr.open_dataset(out) as ds:
+            assert "valid_min" not in ds["unknown_var"].attrs
+            assert "valid_max" not in ds["unknown_var"].attrs
+
+    def test_written_file_has_grid_mapping_variable(self, tmp_path, simple_dataarray, provenance):
+        out = tmp_path / "out.nc"
+        export_netcdf(simple_dataarray, out, provenance, "chl_nn")
+        with xr.open_dataset(out) as ds:
+            assert ds["chl_nn"].attrs["grid_mapping"] == "crs"
+            assert CRS.from_cf(ds["crs"].attrs).to_epsg() == 3035
+
+    def test_written_file_crs_decoded_by_rioxarray(self, tmp_path, simple_dataarray, provenance):
+        out = tmp_path / "out.nc"
+        export_netcdf(simple_dataarray, out, provenance, "chl_nn")
+        with xr.open_dataset(out, decode_coords="all") as ds:
+            assert ds["chl_nn"].rio.crs.to_epsg() == 3035
+
+    def test_written_file_crs_follows_provenance_projection(
+        self, tmp_path, simple_dataarray, provenance
+    ):
+        out = tmp_path / "out.nc"
+        utm = replace(provenance, projection="EPSG:32633")
+        export_netcdf(simple_dataarray, out, utm, "chl_nn")
+        with xr.open_dataset(out, decode_coords="all") as ds:
+            assert ds["chl_nn"].rio.crs.to_epsg() == 32633

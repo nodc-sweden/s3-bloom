@@ -28,7 +28,7 @@ PipelineConfig (validated)
                list[PassResult]
   │
   ▼
-4. Composite ── nanmean over 3-day window ── composite outputs
+4. Composite ── geometric mean over 3-day window ── composite outputs
 ```
 
 ## Step 1: Product search
@@ -48,6 +48,12 @@ The search uses an OData `$filter` with:
   built from the bounding box
 
 Results are sorted by sensing start time and paginated (100 products per page).
+
+The catalogue can list one overpass several times: a near-real-time (`NR`)
+product, later a non-time-critical (`NT`) one, and reprocessed copies. They
+share a sensing start and would map to the same output file, so only the best
+version of each overpass is kept (`NT` over `ST` over `NR`, then the latest
+creation time).
 
 **Output:** A list of `ProductInfo` dataclasses, each containing the product ID,
 title, sensing time, satellite (S3A/S3B), and download size.
@@ -108,9 +114,12 @@ product, processing continues with the next product.
 
 **Skipping already-processed passes:** before loading any data, the pipeline
 checks whether all expected output files (one per dataset × format combination)
-already exist on disk. If they do, the pass is skipped and a "Skipped (outputs
-exist)" message is printed. This makes re-runs fast when only a subset of passes
-are new. Pass `--overwrite` to force reprocessing of every pass regardless.
+already exist on disk and are current. An existing output is current when its
+`s3bloom_value_scale` is `linear` and its `s3bloom_source_product` is the
+product being processed; outputs from s3bloom before 0.2 (log10 values) or from
+a superseded near-real-time product are reprocessed. Current passes are skipped
+with a "Skipped (outputs exist)" message but still take part in compositing.
+Pass `--overwrite` to force reprocessing of every pass regardless.
 
 ### 3a. Scene loading
 
@@ -119,6 +128,10 @@ are new. Pass `--overwrite` to force reprocessing of every pass regardless.
 Uses satpy's `olci_l2` reader to load the requested datasets plus the WQSF
 flag layer. The reader handles the multi-file `.SEN3` structure, coordinate
 decoding, and metadata extraction.
+
+The L2 chlorophyll and TSM variables are stored as log10 of the concentration.
+They are converted to linear units (`10 ** value`) straight after loading, so
+masking, resampling, compositing and every export work on mg m⁻³ / g m⁻³.
 
 The `.nc` files are passed directly to satpy (the XML manifest is not used).
 Files that satpy doesn't recognise (tie points, instrument data, etc.) produce
@@ -174,7 +187,7 @@ data.where(~mask, other=NaN)
 ```
 
 Bad pixels become NaN, which propagates correctly through all downstream
-operations and is automatically excluded by nanmean compositing.
+operations and is automatically excluded by compositing.
 
 ### 3d. Resampling
 
@@ -198,8 +211,16 @@ This is appropriate because:
 - Interpolation would create artificial values at cloud edges
 - The 300m output grid matches the native OLCI resolution
 
-**Coordinate assignment:** After resampling, x/y coordinate arrays in the
-target projection are attached to the DataArray, along with CRS metadata.
+Each target pixel takes the value of its nearest swath pixel, masked or not, so
+a masked pixel stays masked in the output. The radius only limits how far away
+that nearest pixel may be. (Before 0.2 masked swath pixels were left out of the
+search and gaps were filled from valid neighbours up to 1500m away.)
+
+**Coordinate assignment:** After resampling, x/y coordinate arrays holding the
+pixel-centre positions in the target projection are attached to the DataArray,
+along with CRS metadata. The extent is not snapped to the resolution, so the
+actual pixel size can differ slightly from the requested one (299.85 m for the
+default grid).
 
 ### 3e. Export
 
@@ -212,16 +233,18 @@ Each resampled dataset is exported in all configured formats:
 - Directly openable in QGIS, ArcGIS, Google Earth Engine
 
 **NetCDF** (`export/netcdf.py`):
-- CF-1.8 compliant with standard_name, units, valid_min/max
-- Provenance in global attributes (prefixed `s3bloom_`)
+- CF-1.8 compliant with standard_name, units (linear, e.g. `mg m-3`) and the
+  valid range of the product (0–100 mg m⁻³ for chlorophyll)
+- Provenance in global attributes (prefixed `s3bloom_`), including
+  `s3bloom_value_scale = linear`
 - zlib compression level 4
-- Non-serializable coordinates (CRS objects from rioxarray) are stripped
-  before writing; CRS stored as a WKT string attribute instead
+- CRS stored as a CF grid mapping: a scalar `crs` variable referenced by the
+  data variable's `grid_mapping` attribute, readable by GDAL, terra and
+  rioxarray
 
 **PNG** (`export/png.py`):
-- Data converted from log10(mg/m³) to linear mg/m³ for display
 - cmocean "algae" colormap (oceanographic standard for chlorophyll)
-- Log-scaled colorbar with range 0.5–30 mg/m³ (appropriate for coastal
+- Linear colorbar with range 0–30 mg/m³ (appropriate for coastal
   Baltic/Kattegat)
 - Title with satellite, timestamp, and masking preset
 - Masked/land pixels shown in gray
@@ -239,16 +262,21 @@ gaps.
 For each date in the time range:
 1. Collect all passes within a centered N-day window (default: 3 days)
 2. Stack the grids along a new `pass_idx` dimension
-3. Compute `nanmean` — the arithmetic mean ignoring NaN values
+3. Compute the geometric mean ignoring NaN values: average `log10` of the
+   concentrations, then back-transform with `10 **`
 4. Export the composite in all configured formats
 
-### Why nanmean
+### Why a geometric mean
 
-- **Simple and transparent**: easy to understand and reproduce
+- **Suits the data**: chlorophyll is approximately log-normally distributed, so
+  averaging in log space is less dominated by single high retrievals
 - **Cloud-robust**: NaN-masked cloud pixels are automatically excluded
 - **No weighting artefacts**: treats all valid observations equally
 - **Handles overlap**: multiple S3A + S3B passes on the same day are combined
   naturally
+
+The method is recorded in each composite as
+`s3bloom_composite_method = geometric_mean`.
 
 ### Composite dates
 
@@ -256,45 +284,55 @@ A composite is produced for every date between the first and last pass,
 regardless of whether that specific date has data. This gives continuous
 daily coverage when the window captures passes from adjacent days.
 
-**Skipping existing composites:** the same skip logic applies here. If all
-format files for a center date already exist, the composite computation is
-skipped. Pass `--overwrite` to regenerate composites unconditionally.
+**Skipping existing composites:** a composite is skipped when all its format
+files exist and the source products recorded in it match the passes in the
+window. If the window has gained or lost passes it is rebuilt. Pass
+`--overwrite` to regenerate composites unconditionally.
 
-**Limitation with skipped passes:** if a pass is skipped (its per-pass outputs
-exist), it is not loaded into memory and therefore does not contribute to
-composite recomputation. If per-pass outputs exist but composite outputs do not
-(e.g. a run that crashed after processing but before compositing), re-run with
-`--overwrite` to get correct composites from all passes.
+**Resumed runs:** compositing reads the per-pass NetCDF files, so passes that
+were processed in an earlier run are included and a resumed run gives the same
+composites as a fresh one. This needs `netcdf` among `--formats`; without it
+skipped passes cannot be read back, so existing composites for their dates are
+kept as they are, new ones cover only the passes processed in the current run,
+and the CLI prints a warning.
 
 ### File naming
 
 ```
-s3bloom_chl_nn_composite3d_20240316_S3A-S3B.tif
-         │         │          │        │
-         │         │          │        └─ satellites contributing
+s3bloom_chl_nn_composite3d_20240316.tif
+         │         │          │
          │         │          └────────── center date
          │         └───────────────────── 3-day window
          └─────────────────────────────── dataset
 ```
 
+There is one composite per dataset and date. The contributing satellites and
+source products are recorded in the file's provenance.
+
 ## Data units
 
-The OLCI L2 `chl_nn`, `chl_oc4me`, and `tsm_nn` products store values as
-**log10** of the concentration. This is important to understand:
+The OLCI L2 `chl_nn`, `chl_oc4me`, and `tsm_nn` variables are stored in the
+source product as **log10** of the concentration. s3bloom converts them on
+load, so every GeoTIFF, NetCDF and PNG it writes holds **linear** values
+(mg m⁻³ for chlorophyll, g m⁻³ for TSM). Each file says so in the
+`s3bloom_value_scale = linear` attribute (a global attribute in NetCDF, a tag
+in GeoTIFF).
 
-| Stored value | Real concentration |
-|--------------|-------------------|
+**Files written before s3bloom 0.2 are different.** They hold the raw log10
+values although their `units` attribute says mg m⁻³, and they have no
+`s3bloom_value_scale` attribute. Convert them with `10 ** value` before use:
+
+| Value in a pre-0.2 file | Concentration |
+|-------------------------|---------------|
 | -1.0 | 0.1 mg m⁻³ |
 | 0.0 | 1.0 mg m⁻³ |
 | 0.5 | 3.2 mg m⁻³ |
 | 1.0 | 10 mg m⁻³ |
-| 1.5 | 31.6 mg m⁻³ |
 | 2.0 | 100 mg m⁻³ |
 
-The GeoTIFF and NetCDF outputs preserve the original log10-encoded values
-(this is correct for quantitative analysis, since averaging in log-space is
-standard practice for chlorophyll). The PNG maps convert to linear mg/m³ for
-visual interpretation.
+Those files also have masked gaps filled from neighbouring pixels and x/y
+coordinates offset by up to half a pixel (see step 3d); reprocess from the
+`.SEN3` products to remove both.
 
 ## Provenance tracking
 
@@ -330,8 +368,8 @@ Alternative projections can be specified via `--projection`, e.g.
 
 - Products are processed **one at a time** and written to disk before the next
   product is loaded, keeping memory usage bounded
-- Compositing loads only the resampled grids (small: ~576 x 939 x float32 per
-  pass), not the full swath data
-- dask-backed lazy loading is used by satpy for the initial scene, but data is
-  computed before export
+- Each pass is computed once and every format is exported from that array
+- Compositing reads the per-pass NetCDF files lazily, one window at a time, so
+  memory does not grow with the number of passes and raw products can be
+  deleted (`--delete-raw`) as soon as a pass is written
 - Downloads are sequential (max 2 concurrent) to respect CDSE rate limits

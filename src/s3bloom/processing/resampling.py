@@ -19,7 +19,18 @@ Why a 1500 m radius of influence
 --------------------------------
 ~5× the native ~300 m pixel pitch — large enough to fill the target
 grid even when swath pixels are stretched at the edge of the field of
-view, small enough that we never paint over a genuine NaN gap.
+view. The radius is only the maximum distance at which the nearest
+source pixel is accepted; target pixels with no source pixel inside it
+(outside the swath) are set to NaN.
+
+The radius does not by itself protect masked pixels. pyresample's
+default (``mask_area=True``) drops NaN source pixels from the
+neighbour search, so every masked target pixel would take the value of
+the nearest *valid* source pixel up to 1500 m (~5 pixels) away, and
+cloud/flag gaps would shrink or vanish. We therefore resample with
+``mask_area=False``: masked source pixels stay in the search, each
+target pixel takes its true nearest source pixel, and a masked source
+pixel stays masked in the output.
 """
 
 from __future__ import annotations
@@ -92,27 +103,46 @@ def resample_scene(
     target_area : pyresample.geometry.AreaDefinition
         Output grid built by :func:`create_target_area`.
     datasets : list of str
-        Names of datasets to resample. Datasets missing from the scene
-        after resampling are warned and skipped.
+        Names of datasets to resample. Only these are resampled; other
+        datasets in the scene (e.g. the ``wqsf`` flag layer) are left
+        alone. Names missing from the scene are warned and skipped.
 
     Returns
     -------
     dict[str, xarray.DataArray]
         ``{dataset_name: resampled_dataarray}``. Each output carries
-        ``x``/``y`` coordinate arrays in projected metres and a
-        ``crs`` attribute set to the WKT of *target_area*.
+        ``x``/``y`` coordinate arrays holding the pixel-centre
+        positions of *target_area* in projected metres (``y`` running
+        north to south) and a ``crs`` attribute set to the WKT of
+        *target_area*. Source pixels that were NaN stay NaN: a masked
+        pixel is never replaced by a neighbouring valid one.
     """
     logger.info("Resampling %d datasets to target grid", len(datasets))
 
+    # Scene.resample raises KeyError for names it does not hold, so only
+    # ask for the ones that are there.
+    present = [ds_name for ds_name in datasets if ds_name in scene]
+    for ds_name in datasets:
+        if ds_name not in present:
+            logger.warning("Dataset %s not in scene; skipping resampling", ds_name)
+
     resampled_scene = scene.resample(
         target_area,
+        datasets=present,
         resampler="nearest",
         radius_of_influence=1500,
         fill_value=np.nan,
+        # Keep masked (NaN) source pixels in the neighbour search so they
+        # stay masked instead of being filled from valid neighbours.
+        mask_area=False,
+        # Nothing to regenerate: we resample plain datasets, not
+        # composites. Left on, satpy warns that the datasets we chose
+        # not to resample (wqsf) "were not created".
+        generate=False,
     )
 
     results = {}
-    for ds_name in datasets:
+    for ds_name in present:
         if ds_name in resampled_scene:
             da = resampled_scene[ds_name]
             results[ds_name] = _add_spatial_coords(da, target_area)
@@ -160,24 +190,19 @@ def _add_spatial_coords(
 ) -> xr.DataArray:
     """Attach projected ``x``/``y`` coordinate arrays and CRS metadata.
 
-    The y axis is built from ``area_extent[3]`` (north) down to
-    ``area_extent[1]`` (south), matching the row-major top-down ordering
-    that GeoTIFF and other raster formats expect.
+    Coordinates are the pixel *centres* of *area*, so the first ``x`` is
+    half a pixel inside ``area_extent[0]`` and consecutive values are
+    exactly one pixel apart. The y axis runs from the northernmost row
+    (half a pixel below ``area_extent[3]``) down to the southernmost,
+    matching the row-major top-down ordering that GeoTIFF and other
+    raster formats expect.
     """
     if "y" not in data.dims or "x" not in data.dims:
         if len(data.dims) == 2:
             data = data.rename({data.dims[0]: "y", data.dims[1]: "x"})
 
-    x_coords = np.linspace(
-        area.area_extent[0],
-        area.area_extent[2],
-        area.width,
-    )
-    y_coords = np.linspace(
-        area.area_extent[3],
-        area.area_extent[1],
-        area.height,
-    )
+    x_coords = np.asarray(area.projection_x_coords)
+    y_coords = np.asarray(area.projection_y_coords)
 
     data = data.assign_coords(x=("x", x_coords), y=("y", y_coords))
     data.attrs["crs"] = area.crs.to_wkt()

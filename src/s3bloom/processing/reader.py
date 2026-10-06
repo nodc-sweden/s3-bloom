@@ -9,21 +9,45 @@ The satellite identifier (S3A/S3B) and sensing time are parsed from the
 directory name rather than from file metadata. This is safe because
 EUMETSAT guarantees the naming convention; doing it this way avoids
 having to load the heavy NetCDFs just to read two scalars.
+
+Value scale
+-----------
+OLCI L2 stores chlorophyll, TSM and the IOPs as ``log10`` of the
+physical quantity, and satpy hands them over unchanged with units such
+as ``"lg(re mg.m-3)"``. :func:`load_scene` converts every such dataset
+to **linear** values (:func:`to_linear`) right after loading, so that
+masking, resampling, compositing and every exporter work on, and write,
+real concentrations.
+
+satpy's own ``reader_kwargs={"unlog": True}`` is deliberately not used:
+in satpy 0.60 it makes the ``wqsf`` flag layer fail to load
+(``KeyError: 'units'``), which would break quality masking.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+import xarray as xr
 from satpy import Scene
 from s3bloom._winpath import win_path
 
 logger = logging.getLogger(__name__)
 
 READER_NAME = "olci_l2"
+
+# satpy/OLCI notation for "log10 of a quantity relative to <unit>",
+# e.g. ``"lg(re mg.m-3)"``.
+LOG10_UNITS_PREFIX = "lg("
+_LOG10_REFERENCE_PREFIX = "re "
+
+# How satpy's ``long_name`` announces ``log10`` values, e.g.
+# ``"log10 scaled (Neural Net) Algal pigment concentration"``.
+_LOG10_LONG_NAME_PREFIX = re.compile(r"^log10 scaled ", re.IGNORECASE)
 
 
 def load_scene(
@@ -47,7 +71,10 @@ def load_scene(
     -------
     satpy.Scene
         Scene with the requested datasets and ``wqsf`` available via
-        ``scene[name]``.
+        ``scene[name]``. Datasets that the product stores as ``log10``
+        (units starting with ``"lg("``) are returned as linear values
+        with the plain unit, e.g. ``"mg.m-3"``; see :func:`to_linear`.
+        ``wqsf`` is returned exactly as satpy loaded it.
 
     Raises
     ------
@@ -82,11 +109,76 @@ def load_scene(
 
     # WQSF is required for downstream quality masking, regardless of
     # which scientific datasets the caller asked for.
-    to_load.append("wqsf")
-    scn.load(to_load)
+    scn.load([*to_load, "wqsf"])
+
+    # Only the requested science datasets are converted; ``wqsf`` is a
+    # bitfield and must reach the masking step untouched.
+    for name in to_load:
+        if name not in scn:
+            continue
+        loaded = scn[name]
+        linear = to_linear(loaded)
+        if linear is not loaded:
+            scn[name] = linear
+            logger.info(
+                "Converted %s from log10 (%s) to linear (%s)",
+                name,
+                loaded.attrs["units"],
+                linear.attrs["units"],
+            )
 
     logger.info("Loaded datasets: %s", list(scn.keys()))
     return scn
+
+
+def to_linear(data: xr.DataArray) -> xr.DataArray:
+    """Convert a ``log10``-encoded DataArray to linear values.
+
+    A dataset counts as ``log10``-encoded when its ``units`` attribute
+    starts with ``"lg("`` (satpy's notation, e.g. ``"lg(re mg.m-3)"``).
+
+    Parameters
+    ----------
+    data : xarray.DataArray
+        Dataset as loaded by satpy. Not modified.
+
+    Returns
+    -------
+    xarray.DataArray
+        For ``log10``-encoded input, a new array holding ``10 ** data``
+        with the same dims, coords, dtype and laziness (a dask-backed
+        input stays dask-backed). Every attribute is carried over —
+        including ``area``, which resampling depends on — except the
+        two that describe the scale: ``units`` becomes the inner unit
+        (``"lg(re mg.m-3)"`` → ``"mg.m-3"``), and a ``long_name``
+        starting with ``"log10 scaled "`` (any case) loses that prefix,
+        because the GeoTIFF exporter writes it as the band description.
+        Other ``long_name`` values are kept unchanged. The ``encoding``
+        (the product's integer packing of the ``log10`` values) is not
+        carried over, as it does not describe linear data. Any other
+        input is returned as is.
+    """
+    units = data.attrs.get("units")
+    if not isinstance(units, str) or not units.startswith(LOG10_UNITS_PREFIX):
+        return data
+
+    linear_attrs = {"units": _linear_units(units)}
+    long_name = data.attrs.get("long_name")
+    if isinstance(long_name, str):
+        linear_attrs["long_name"] = _LOG10_LONG_NAME_PREFIX.sub("", long_name)
+
+    # Work on the underlying (dask) array: xarray arithmetic would drop
+    # the attributes, and ``copy`` keeps them without touching ``data``.
+    linear = data.copy(deep=False, data=10 ** data.data).drop_encoding()
+    return linear.assign_attrs(**linear_attrs)
+
+
+def _linear_units(log_units: str) -> str:
+    """Return the unit inside an ``"lg(re <unit>)"`` string."""
+    inner = log_units[len(LOG10_UNITS_PREFIX):].strip()
+    if inner.endswith(")"):
+        inner = inner[:-1]
+    return inner.removeprefix(_LOG10_REFERENCE_PREFIX).strip()
 
 
 def extract_sensing_time(product_path: Path) -> datetime:
